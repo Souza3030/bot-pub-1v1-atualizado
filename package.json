@@ -1,0 +1,31 @@
+{
+  "name": "mamoball-1v1",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Bot Discord independente para uma fila competitiva MamoBall",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "deploy": "ts-node src/deploy-commands.ts",
+    "test": "npm run build && node --test --test-isolation=none dist/queue.test.js dist/playerStats.test.js dist/rankTiers.test.js dist/matchVoting.test.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^14.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.5"
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
