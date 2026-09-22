@@ -16,21 +16,8 @@ function staffOverwrite(): OverwriteResolvable[] {
 
 export async function createMatchChannels(guild: Guild, matchId: string, teamA: Team, teamB: Team): Promise<MatchChannels> {
   const players = [...teamA.memberIds, ...teamB.memberIds];
-  const botMember = guild.members.me ?? await guild.members.fetchMe();
-  const botOverwrite: OverwriteResolvable = {
-    id: botMember.id,
-    allow: [
-      PermissionFlagsBits.ViewChannel,
-      PermissionFlagsBits.ManageChannels,
-      PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.ReadMessageHistory,
-      PermissionFlagsBits.Connect,
-      PermissionFlagsBits.Speak,
-    ],
-  };
   const common: OverwriteResolvable[] = [
     { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-    botOverwrite,
     ...staffOverwrite(),
     ...players.map((id) => ({
       id,
@@ -55,7 +42,6 @@ export async function createMatchChannels(guild: Guild, matchId: string, teamA: 
     userLimit: MODE.playersPerTeam,
     permissionOverwrites: [
       { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
-      botOverwrite,
       ...staffOverwrite(),
       ...members.map((id) => ({
         id,
@@ -63,24 +49,15 @@ export async function createMatchChannels(guild: Guild, matchId: string, teamA: 
       })),
     ],
   });
-  const sideA = await voice("time-azul", teamA.memberIds);
-  const sideB = await voice("time-vermelho", teamB.memberIds);
+  const sideA = await voice("lado-a", teamA.memberIds);
+  const sideB = await voice("lado-b", teamB.memberIds);
   return { categoryId: category.id, textChannelId: text.id, voiceChannelAId: sideA.id, voiceChannelBId: sideB.id };
 }
 
 export async function deleteMatchChannels(guild: Guild, channels: MatchChannels): Promise<void> {
   for (const id of [channels.textChannelId, channels.voiceChannelAId, channels.voiceChannelBId, channels.categoryId]) {
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const channel = await guild.channels.fetch(id).catch(() => null);
-      if (!channel) break;
-      try {
-        await channel.delete(`Partida ${channels.categoryId} encerrada`);
-        break;
-      } catch (error) {
-        console.error(`[Channels] Falha ao excluir ${id}, tentativa ${attempt}/3`, error);
-        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 750));
-      }
-    }
+    const channel = await guild.channels.fetch(id).catch(() => null);
+    if (channel) await channel.delete().catch(() => undefined);
   }
 }
 

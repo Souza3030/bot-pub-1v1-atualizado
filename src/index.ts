@@ -1,35 +1,144 @@
-import { Client, Events, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  MessageFlags,
+} from "discord.js";
+
+import http from "http";
+
 import { Arena } from "./arena";
 import { handleCommand } from "./commands";
 import { config } from "./config";
 import { MODE } from "./mode";
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+// ==============================
+// SERVIDOR HTTP - RENDER
+// ==============================
+
+const PORT = Number(process.env.PORT) || 3000;
+
+const server = http.createServer((_req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/plain; charset=utf-8",
+  });
+
+  res.end("Bot está rodando!");
 });
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`[HTTP] Servidor ativo na porta ${PORT}`);
+});
+
+// ==============================
+// CLIENTE DO DISCORD
+// ==============================
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+  ],
+});
+
 const arena = new Arena();
+
 globalThis.botClient = client;
 
-client.once(Events.ClientReady, async () => {
-  const guild = await client.guilds.fetch(config.discord.guildId);
-  await arena.ready(guild);
-  console.log(`[MamoBall] ${MODE.label} online como ${client.user?.tag}`);
-});
+// ==============================
+// BOT PRONTO
+// ==============================
 
-client.on(Events.InteractionCreate, async (interaction) => {
+client.once(Events.ClientReady, async (readyClient) => {
   try {
-    if (interaction.isChatInputCommand()) await handleCommand(interaction, arena);
-    else if (interaction.isButton()) await arena.handleButton(interaction);
+    const guild = await readyClient.guilds.fetch(
+      config.discord.guildId
+    );
+
+    await arena.ready(guild);
+
+    console.log(
+      `[MamoBall] ${MODE.label} online como ${readyClient.user.tag}`
+    );
   } catch (error) {
-    console.error("[Interaction]", error);
-    const payload = { content: "Falha interna.", ephemeral: true } as const;
-    if (!interaction.isRepliable()) return;
-    if (interaction.replied || interaction.deferred) await interaction.followUp(payload).catch(() => undefined);
-    else await interaction.reply(payload).catch(() => undefined);
+    console.error("[ClientReady] Erro ao iniciar a Arena:", error);
   }
 });
 
+// ==============================
+// INTERAÇÕES
+// ==============================
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      await handleCommand(interaction, arena);
+      return;
+    }
+
+    if (interaction.isButton()) {
+      await arena.handleButton(interaction);
+      return;
+    }
+
+    if (interaction.isModalSubmit()) {
+      await arena.handleModal(interaction);
+      return;
+    }
+  } catch (error) {
+    console.error("[Interaction] Erro:", error);
+
+    if (!interaction.isRepliable()) {
+      return;
+    }
+
+    try {
+      // Se a interação foi adiada, finaliza a resposta pendente.
+      if (interaction.deferred) {
+        await interaction.editReply({
+          content: "Falha interna.",
+        });
+
+        return;
+      }
+
+      // Se já houve resposta, envia uma nova mensagem privada.
+      if (interaction.replied) {
+        await interaction.followUp({
+          content: "Falha interna.",
+          flags: MessageFlags.Ephemeral,
+        });
+
+        return;
+      }
+
+      // Se ainda não houve resposta.
+      await interaction.reply({
+        content: "Falha interna.",
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (replyError) {
+      console.error(
+        "[Interaction] Não foi possível responder ao erro:",
+        replyError
+      );
+    }
+  }
+});
+
+// ==============================
+// ERROS DO CLIENTE
+// ==============================
+
+client.on(Events.Error, (error) => {
+  console.error("[Discord Client] Erro:", error);
+});
+
+// ==============================
+// LOGIN
+// ==============================
+
 client.login(config.discord.token).catch((error) => {
-  console.error("Falha ao conectar.", error);
+  console.error("[Discord] Falha ao conectar:", error);
   process.exit(1);
 });

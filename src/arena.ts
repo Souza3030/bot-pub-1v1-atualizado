@@ -1,31 +1,31 @@
 import {
+  ActionRowBuilder,
   ButtonInteraction,
   ChannelType,
   EmbedBuilder,
   Guild,
   Message,
+  ModalBuilder,
+  ModalSubmitInteraction,
   PermissionFlagsBits,
   TextChannel,
+  TextInputBuilder,
+  TextInputStyle,
 } from "discord.js";
 import { cleanupStaleChannels, createMatchChannels, deleteMatchChannels } from "./channels";
 import { config } from "./config";
-import { IDs, trailingId } from "./ids";
+import { IDs, trailingId, withId } from "./ids";
 import { MODE } from "./mode";
-import { recordVote } from "./matchVoting";
 import {
   checkinPanel,
-  disputedResultPanel,
-  expiredResultPanel,
-  finishedMatchPanel,
   matchPanel,
   queuePanel,
-  queueStatusPanel,
+  staffResultPanel,
 } from "./presentation";
 import { QueueManager } from "./queue";
-import { permissionReport } from "./permissions";
 import { syncPlayersRankRoles } from "./rankRoles";
 import { PlayerStore } from "./storage";
-import { ActiveMatch, MatchSide, Team } from "./types";
+import { ActiveMatch, Team } from "./types";
 
 interface CheckinSession {
   id: string;
@@ -38,7 +38,7 @@ interface CheckinSession {
   completing: boolean;
 }
 
-interface MessageLocation {
+interface PanelLocation {
   guildId: string;
   channelId: string;
   messageId: string;
@@ -54,13 +54,10 @@ export class Arena {
   readonly matches = new Map<string, ActiveMatch>();
   private readonly checkins = new Map<string, CheckinSession>();
   private readonly processingResults = new Set<string>();
-  private panel?: MessageLocation;
-  private queueMessage?: MessageLocation;
+  private panel?: PanelLocation;
 
   async ready(guild: Guild): Promise<void> {
     await this.store.load();
-    const report = await permissionReport(guild);
-    if (!report.ok) console.warn(`[Permissions]\n${report.lines.join("\n")}`);
     await cleanupStaleChannels(guild);
     await this.ensurePanel(guild);
     setInterval(() => this.removeInactive(guild), 60_000).unref();
@@ -70,13 +67,16 @@ export class Arena {
   async ensurePanel(guild: Guild): Promise<Message> {
     const channel = await guild.channels.fetch(config.channels.queue);
     if (!channel || channel.type !== ChannelType.GuildText) throw new Error("QUEUE_CHANNEL_ID invalido");
+
     const recent = await channel.messages.fetch({ limit: 50 });
     const existing = recent.find((message) =>
       message.author.id === guild.members.me?.id &&
       message.embeds[0]?.author?.name === "MAMOBALL / ARENA" &&
-      message.embeds[0]?.title?.startsWith(MODE.label)
+      message.embeds[0]?.title === MODE.label
     );
-    const message = existing ? await existing.edit(queuePanel()) : await channel.send(queuePanel());
+    const message = existing
+      ? await existing.edit(queuePanel(this.queue))
+      : await channel.send(queuePanel(this.queue));
     this.panel = { guildId: guild.id, channelId: channel.id, messageId: message.id };
     return message;
   }
@@ -85,15 +85,55 @@ export class Arena {
     if (interaction.customId === IDs.queueJoin) return this.join(interaction);
     if (interaction.customId === IDs.queueLeave) return this.leave(interaction);
     if (interaction.customId.startsWith(`${IDs.checkin}:`)) return this.confirm(interaction);
-    if (
-      interaction.customId.startsWith(`${IDs.winnerBlue}:`) ||
-      interaction.customId.startsWith(`${IDs.winnerRed}:`)
-    ) return this.voteWinner(interaction);
-    if (
-      interaction.customId.startsWith(`${IDs.staffBlue}:`) ||
-      interaction.customId.startsWith(`${IDs.staffRed}:`) ||
-      interaction.customId.startsWith(`${IDs.void}:`)
-    ) return this.staffDecision(interaction);
+    if (interaction.customId.startsWith(`${IDs.result}:`)) return this.openResultModal(interaction);
+    if ([IDs.approve, IDs.reject, IDs.void].some((id) => interaction.customId.startsWith(`${id}:`))) {
+      return this.staffDecision(interaction);
+    }
+  }
+
+  async handleModal(interaction: ModalSubmitInteraction): Promise<void> {
+    if (!interaction.customId.startsWith(`${IDs.resultModal}:`)) return;
+    const matchId = trailingId(interaction.customId);
+    const match = this.matches.get(matchId);
+    if (!match || !interaction.guild) {
+      await interaction.reply({ content: "Partida encerrada.", ephemeral: true });
+      return;
+    }
+    if (![...match.teamA.memberIds, ...match.teamB.memberIds].includes(interaction.user.id)) {
+      await interaction.reply({ content: "Acesso negado.", ephemeral: true });
+      return;
+    }
+    if (match.pendingResult) {
+      await interaction.reply({ content: "Resultado em analise.", ephemeral: true });
+      return;
+    }
+    const scoreA = Number(interaction.fields.getTextInputValue(IDs.scoreA));
+    const scoreB = Number(interaction.fields.getTextInputValue(IDs.scoreB));
+    if (!Number.isInteger(scoreA) || !Number.isInteger(scoreB) || scoreA < 0 || scoreB < 0 || scoreA === scoreB) {
+      await interaction.reply({ content: "Placar invalido.", ephemeral: true });
+      return;
+    }
+    match.pendingResult = {
+      submittedBy: interaction.user.id,
+      scoreA,
+      scoreB,
+      winner: scoreA > scoreB ? "A" : "B",
+    };
+    const staff = await interaction.guild.channels.fetch(config.channels.staff).catch(() => null);
+    if (!staff || staff.type !== ChannelType.GuildText) {
+      match.pendingResult = undefined;
+      await interaction.reply({ content: "Canal da staff indisponivel.", ephemeral: true });
+      return;
+    }
+    try {
+      await staff.send(staffResultPanel(match));
+      await this.editMatchAnnouncement(interaction.guild, match, true);
+      await interaction.reply({ content: "Resultado enviado.", ephemeral: true });
+    } catch (error) {
+      match.pendingResult = undefined;
+      console.error("[Result]", error);
+      await interaction.reply({ content: "Falha no envio.", ephemeral: true });
+    }
   }
 
   private async join(interaction: ButtonInteraction): Promise<void> {
@@ -105,19 +145,23 @@ export class Arena {
       return;
     }
     await interaction.reply({ content: `Entrada confirmada. ${this.queue.size()}/${MODE.totalPlayers}`, ephemeral: true });
-    const channel = interaction.channel?.type === ChannelType.GuildText ? interaction.channel : undefined;
-    await this.refreshQueueMessage(interaction.guild, channel);
-
+    await this.refreshPanel(interaction.guild);
     const players = this.queue.takeBatch();
     if (!players) return;
-    const queueChannel = channel ?? await this.getQueueChannel(interaction.guild);
+    await this.refreshPanel(interaction.guild);
+    const channel = interaction.channel;
+    if (!channel || channel.type !== ChannelType.GuildText) {
+      this.queue.reopen();
+      this.queue.requeue(players);
+      return;
+    }
     try {
-      await this.startCheckin(interaction.guild, queueChannel, players);
+      await this.startCheckin(interaction.guild, channel, players);
     } catch (error) {
       console.error("[Checkin]", error);
       this.queue.reopen();
       this.queue.requeue(players);
-      await this.refreshQueueMessage(interaction.guild, queueChannel);
+      await this.refreshPanel(interaction.guild);
     }
   }
 
@@ -125,17 +169,13 @@ export class Arena {
     if (!interaction.guild) return;
     const removed = this.queue.leave(interaction.user.id);
     await interaction.reply({ content: removed ? "Saida confirmada." : "Voce nao esta na fila.", ephemeral: true });
-    if (removed) await this.refreshQueueMessage(interaction.guild);
+    if (removed) await this.refreshPanel(interaction.guild);
   }
 
   private async startCheckin(guild: Guild, channel: TextChannel, players: string[]): Promise<void> {
     const id = code(8);
     const confirmed = new Set<string>();
-    const existing = await this.fetchQueueMessage(guild);
-    const message = existing
-      ? await existing.edit(checkinPanel(id, players, confirmed))
-      : await channel.send(checkinPanel(id, players, confirmed));
-    this.queueMessage = { guildId: guild.id, channelId: channel.id, messageId: message.id };
+    const message = await channel.send(checkinPanel(id, players, confirmed));
     const session: CheckinSession = {
       id,
       guildId: guild.id,
@@ -162,7 +202,6 @@ export class Arena {
     session.confirmed.add(interaction.user.id);
     await interaction.update(checkinPanel(session.id, session.players, session.confirmed));
     if (session.confirmed.size !== session.players.length) return;
-
     session.completing = true;
     clearTimeout(session.timeout);
     this.checkins.delete(session.id);
@@ -171,16 +210,18 @@ export class Arena {
     try {
       const match = await this.createMatch(interaction.guild, session.players);
       await interaction.message.edit({
-        embeds: [new EmbedBuilder().setColor(MODE.accent).setTitle(`✅ ${match.id}`).setDescription("Partida criada.")],
+        embeds: [new EmbedBuilder().setColor(MODE.accent).setTitle(match.id).setDescription("`PARTIDA CRIADA`")],
         components: [],
       });
-      this.queueMessage = undefined;
-      setTimeout(() => interaction.message.delete().catch(() => undefined), 10_000);
     } catch (error) {
       console.error("[Match]", error);
       this.queue.requeue(session.players);
-      await this.refreshQueueMessage(interaction.guild);
+      await interaction.message.edit({
+        embeds: [new EmbedBuilder().setColor(0x6b7280).setTitle(MODE.label).setDescription("`FILA RESTAURADA`")],
+        components: [],
+      });
     }
+    await this.refreshPanel(interaction.guild);
   }
 
   private async expireCheckin(id: string): Promise<void> {
@@ -191,46 +232,36 @@ export class Arena {
     this.queue.requeue([...session.confirmed]);
     const guild = globalThis.botClient?.guilds.cache.get(session.guildId);
     if (!guild) return;
-    if (this.queue.size()) {
-      await this.refreshQueueMessage(guild);
-    } else {
-      const message = await this.fetchQueueMessage(guild);
-      await message?.delete().catch(() => undefined);
-      this.queueMessage = undefined;
+    const channel = await guild.channels.fetch(session.channelId).catch(() => null);
+    if (channel?.isTextBased() && !channel.isDMBased()) {
+      const message = await channel.messages.fetch(session.messageId).catch(() => null);
+      await message?.edit({
+        embeds: [new EmbedBuilder().setColor(0x6b7280).setTitle(MODE.label).setDescription("`CHECK-IN ENCERRADO`")],
+        components: [],
+      }).catch(() => undefined);
     }
+    await this.refreshPanel(guild);
   }
 
   private async createMatch(guild: Guild, playerIds: string[]): Promise<ActiveMatch> {
     const { teamA, teamB } = await this.balance(playerIds);
     const id = code();
     const channels = await createMatchChannels(guild, id, teamA, teamB);
-    const match: ActiveMatch = {
-      id,
-      teamA,
-      teamB,
-      createdAt: Date.now(),
-      resultVotes: {},
-      resultDeadlineAt: Date.now() + config.resultConfirmationTimeoutMs,
-      ...channels,
-    };
+    const match: ActiveMatch = { id, teamA, teamB, createdAt: Date.now(), ...channels };
     this.matches.set(id, match);
     const channel = await guild.channels.fetch(match.textChannelId);
     if (!channel || channel.type !== ChannelType.GuildText) throw new Error("Canal da partida nao criado");
-    const mentions = playerIds.map((playerId) => `<@${playerId}>`).join(" ");
-    const announcement = await channel.send({ content: mentions, ...matchPanel(match) });
+    const allMentions = playerIds.map((playerId) => `<@${playerId}>`).join(" ");
+    const announcement = await channel.send({ content: allMentions, ...matchPanel(match) });
     match.announcementMessageId = announcement.id;
-    match.resultTimeout = setTimeout(
-      () => this.expireResultConfirmation(guild, match.id),
-      config.resultConfirmationTimeoutMs,
-    );
     return match;
   }
 
   private async balance(playerIds: string[]): Promise<{ teamA: Team; teamB: Team }> {
     const rated = await Promise.all(playerIds.map(async (id) => ({ id, points: (await this.store.get(id)).points })));
     rated.sort((a, b) => b.points - a.points);
-    const teamA: Team = { name: "BLUE", memberIds: [] };
-    const teamB: Team = { name: "RED", memberIds: [] };
+    const teamA: Team = { name: "A", memberIds: [] };
+    const teamB: Team = { name: "B", memberIds: [] };
     let scoreA = 0;
     let scoreB = 0;
     for (const player of rated) {
@@ -244,146 +275,109 @@ export class Arena {
     return { teamA, teamB };
   }
 
-  private async voteWinner(interaction: ButtonInteraction): Promise<void> {
+  private async openResultModal(interaction: ButtonInteraction): Promise<void> {
     const match = this.matches.get(trailingId(interaction.customId));
-    if (!match || !interaction.guild) {
-      await interaction.reply({ content: "Partida encerrada.", ephemeral: true });
-      return;
-    }
-    const voterSide = match.teamA.memberIds.includes(interaction.user.id)
-      ? "BLUE"
-      : match.teamB.memberIds.includes(interaction.user.id) ? "RED" : undefined;
-    if (!voterSide) {
-      await interaction.reply({ content: "Apenas jogadores da partida podem confirmar.", ephemeral: true });
-      return;
-    }
-    if (Date.now() >= match.resultDeadlineAt) {
-      await interaction.reply({ content: "Tempo encerrado. A staff deve decidir.", ephemeral: true });
-      return;
-    }
-    const winner: MatchSide = interaction.customId.startsWith(`${IDs.winnerBlue}:`) ? "blue" : "red";
-    const result = recordVote(match.resultVotes, voterSide, winner);
-    if (result.status === "duplicate") {
-      await interaction.reply({ content: "Seu time ja confirmou.", ephemeral: true });
-      return;
-    }
-    if (result.status === "waiting") {
-      await interaction.update(matchPanel(match));
-      return;
-    }
-    if (result.status === "disputed") {
-      await interaction.update(disputedResultPanel(match));
-      return;
-    }
-    await this.finalizeResult(interaction, interaction.guild, match, result.winner);
-  }
-
-  private async staffDecision(interaction: ButtonInteraction): Promise<void> {
-    const match = this.matches.get(trailingId(interaction.customId));
-    const guild = interaction.guild;
-    if (!guild || !match) {
-      await interaction.reply({ content: "Partida encerrada.", ephemeral: true });
-      return;
-    }
-    const member = await guild.members.fetch(interaction.user.id).catch(() => null);
-    const isStaff = Boolean(
-      member?.permissions.has(PermissionFlagsBits.ManageGuild) ||
-      (config.staffRoleId && member?.roles.cache.has(config.staffRoleId))
-    );
-    if (!isStaff) {
+    if (!match || ![...match.teamA.memberIds, ...match.teamB.memberIds].includes(interaction.user.id)) {
       await interaction.reply({ content: "Acesso negado.", ephemeral: true });
       return;
     }
-    if (interaction.customId.startsWith(`${IDs.void}:`)) {
-      if (match.resultTimeout) clearTimeout(match.resultTimeout);
-      await interaction.update(finishedMatchPanel(match));
-      this.matches.delete(match.id);
-      await deleteMatchChannels(guild, match);
+    if (match.pendingResult) {
+      await interaction.reply({ content: "Resultado em analise.", ephemeral: true });
       return;
     }
-    const winner: MatchSide = interaction.customId.startsWith(`${IDs.staffBlue}:`) ? "blue" : "red";
-    await this.finalizeResult(interaction, guild, match, winner);
+    const input = (id: string, label: string) => new ActionRowBuilder<TextInputBuilder>().addComponents(
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setMaxLength(2).setRequired(true),
+    );
+    const modal = new ModalBuilder()
+      .setCustomId(withId(IDs.resultModal, match.id))
+      .setTitle(`RESULTADO / ${match.id}`)
+      .addComponents(input(IDs.scoreA, "PLACAR A"), input(IDs.scoreB, "PLACAR B"));
+    await interaction.showModal(modal);
   }
 
-  private async finalizeResult(
-    interaction: ButtonInteraction,
-    guild: Guild,
-    match: ActiveMatch,
-    winner: MatchSide,
-  ): Promise<void> {
-    if (this.processingResults.has(match.id)) {
-      await interaction.reply({ content: "Resultado em processamento.", ephemeral: true });
+  private async staffDecision(interaction: ButtonInteraction): Promise<void> {
+    const matchId = trailingId(interaction.customId);
+    const match = this.matches.get(matchId);
+    const guild = interaction.guild;
+    if (!guild || !match) {
+      await interaction.update({ content: "Partida encerrada.", embeds: [], components: [] });
       return;
     }
-    this.processingResults.add(match.id);
-    await interaction.deferUpdate();
+    const member = await guild.members.fetch(interaction.user.id).catch(() => null);
+    const staff = Boolean(member?.permissions.has(PermissionFlagsBits.ManageGuild) || (config.staffRoleId && member?.roles.cache.has(config.staffRoleId)));
+    if (!staff) {
+      await interaction.reply({ content: "Acesso negado.", ephemeral: true });
+      return;
+    }
+    if (!match.pendingResult || this.processingResults.has(matchId)) {
+      await interaction.reply({ content: "Resultado indisponivel.", ephemeral: true });
+      return;
+    }
+    const action = interaction.customId.slice(0, interaction.customId.lastIndexOf(":"));
+    if (action === IDs.reject) {
+      match.pendingResult = undefined;
+      await interaction.update({ content: `REJEITADO / ${match.id}`, embeds: [], components: [] });
+      await this.editMatchAnnouncement(guild, match, false);
+      return;
+    }
+    if (action === IDs.void) {
+      match.pendingResult = undefined;
+      await interaction.update({ content: `ANULADO / ${match.id}`, embeds: [], components: [] });
+      await this.finishMatch(guild, match, "`PARTIDA ANULADA`");
+      return;
+    }
+    if (action !== IDs.approve) return;
+    this.processingResults.add(matchId);
+    const result = match.pendingResult;
     try {
-      const winners = winner === "blue" ? match.teamA.memberIds : match.teamB.memberIds;
-      const losers = winner === "blue" ? match.teamB.memberIds : match.teamA.memberIds;
+      const winners = result.winner === "A" ? match.teamA.memberIds : match.teamB.memberIds;
+      const losers = result.winner === "A" ? match.teamB.memberIds : match.teamA.memberIds;
       await this.store.applyResult(winners, losers, MODE.key, config.points.win, config.points.loss);
       await syncPlayersRankRoles(guild, [...winners, ...losers], async (id) => (await this.store.get(id)).points);
+      match.pendingResult = undefined;
+      await interaction.update({ content: `APROVADO / ${match.id}`, embeds: [], components: [] });
+      await this.finishMatch(guild, match, `\`A ${result.scoreA}  /  ${result.scoreB} B\``);
     } catch (error) {
-      console.error("[Result]", error);
-      match.resultVotes = {};
-      await interaction.editReply(matchPanel(match)).catch(() => undefined);
-      await interaction.followUp({ content: "Nao foi possivel atualizar os pontos. Tente novamente.", ephemeral: true }).catch(() => undefined);
-      this.processingResults.delete(match.id);
-      return;
+      console.error("[Approval]", error);
+      await interaction.reply({ content: "Falha na gravacao.", ephemeral: true }).catch(() => undefined);
+    } finally {
+      this.processingResults.delete(matchId);
     }
-
-    if (match.resultTimeout) clearTimeout(match.resultTimeout);
-    this.matches.delete(match.id);
-    await interaction.editReply(finishedMatchPanel(match, winner)).catch((error) => {
-      console.error(`[Result] Pontos gravados, mas a mensagem ${match.id} nao foi atualizada`, error);
-    });
-    await deleteMatchChannels(guild, match);
-    this.processingResults.delete(match.id);
   }
 
-  private async expireResultConfirmation(guild: Guild, matchId: string): Promise<void> {
-    const match = this.matches.get(matchId);
-    if (!match || this.processingResults.has(matchId) || !match.announcementMessageId) return;
+  private async finishMatch(guild: Guild, match: ActiveMatch, description: string): Promise<void> {
+    const channel = await guild.channels.fetch(match.textChannelId).catch(() => null);
+    if (channel?.isTextBased() && !channel.isDMBased()) {
+      await channel.send({ embeds: [new EmbedBuilder().setColor(MODE.accent).setTitle(match.id).setDescription(description)] });
+    }
+    this.matches.delete(match.id);
+    setTimeout(() => deleteMatchChannels(guild, match), config.channelDeleteDelayMs);
+  }
+
+  private async editMatchAnnouncement(guild: Guild, match: ActiveMatch, disabled: boolean): Promise<void> {
+    if (!match.announcementMessageId) return;
     const channel = await guild.channels.fetch(match.textChannelId).catch(() => null);
     if (!channel || channel.type !== ChannelType.GuildText) return;
     const message = await channel.messages.fetch(match.announcementMessageId).catch(() => null);
-    await message?.edit(expiredResultPanel(match)).catch((error) => {
-      console.error(`[Result] Falha ao encerrar confirmacao de ${matchId}`, error);
-    });
+    await message?.edit(matchPanel(match, disabled)).catch(() => undefined);
   }
 
-  private async getQueueChannel(guild: Guild): Promise<TextChannel> {
-    const channel = await guild.channels.fetch(config.channels.queue);
-    if (!channel || channel.type !== ChannelType.GuildText) throw new Error("QUEUE_CHANNEL_ID invalido");
-    return channel;
-  }
-
-  private async fetchQueueMessage(guild: Guild): Promise<Message | null> {
-    if (!this.queueMessage) return null;
-    const channel = await guild.channels.fetch(this.queueMessage.channelId).catch(() => null);
-    if (!channel || channel.type !== ChannelType.GuildText) return null;
-    return channel.messages.fetch(this.queueMessage.messageId).catch(() => null);
-  }
-
-  private async refreshQueueMessage(guild: Guild, preferredChannel?: TextChannel): Promise<void> {
-    const current = await this.fetchQueueMessage(guild);
-    if (!this.queue.size()) {
-      await current?.delete().catch(() => undefined);
-      this.queueMessage = undefined;
+  private async refreshPanel(guild: Guild): Promise<void> {
+    if (!this.panel) {
+      await this.ensurePanel(guild);
       return;
     }
-    if (current) {
-      await current.edit(queueStatusPanel(this.queue));
-      return;
-    }
-    const channel = preferredChannel ?? await this.getQueueChannel(guild);
-    const message = await channel.send(queueStatusPanel(this.queue));
-    this.queueMessage = { guildId: guild.id, channelId: channel.id, messageId: message.id };
+    const channel = await guild.channels.fetch(this.panel.channelId).catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildText) return;
+    const message = await channel.messages.fetch(this.panel.messageId).catch(() => null);
+    if (message) await message.edit(queuePanel(this.queue));
+    else await this.ensurePanel(guild);
   }
 
   private async removeInactive(guild: Guild): Promise<void> {
     const removed = this.queue.purgeOlderThan(config.queueTimeoutMs);
     if (!removed.length) return;
-    await this.refreshQueueMessage(guild);
+    await this.refreshPanel(guild);
     for (const id of removed) {
       const user = await guild.client.users.fetch(id).catch(() => null);
       await user?.send(`Fila ${MODE.label} encerrada por inatividade.`).catch(() => undefined);

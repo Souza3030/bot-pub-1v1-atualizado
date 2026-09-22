@@ -14,7 +14,7 @@ export interface PlayerStats {
 }
 
 export interface Team {
-  name: "BLUE" | "RED";
+  name: "A" | "B";
   memberIds: string[];
 }
 
@@ -25,7 +25,12 @@ export interface MatchChannels {
   voiceChannelBId: string;
 }
 
-export type MatchSide = "blue" | "red";
+export interface PendingResult {
+  submittedBy: string;
+  scoreA: number;
+  scoreB: number;
+  winner: "A" | "B";
+}
 
 export interface ActiveMatch extends MatchChannels {
   id: string;
@@ -33,7 +38,5 @@ export interface ActiveMatch extends MatchChannels {
   teamB: Team;
   createdAt: number;
   announcementMessageId?: string;
-  resultVotes: Partial<Record<"BLUE" | "RED", MatchSide>>;
-  resultDeadlineAt: number;
-  resultTimeout?: NodeJS.Timeout;
+  pendingResult?: PendingResult;
 }

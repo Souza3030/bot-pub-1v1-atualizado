@@ -18,6 +18,7 @@ export const config = {
     guildId: required("DISCORD_GUILD_ID"),
   },
   channels: {
+    staff: required("STAFF_CHANNEL_ID"),
     queue: required("QUEUE_CHANNEL_ID"),
   },
   staffRoleId: process.env.STAFF_ROLE_ID?.trim() || undefined,
@@ -38,7 +39,7 @@ export const config = {
   },
   queueTimeoutMs: optionalNumber("QUEUE_TIMEOUT_MINUTES", 15) * 60_000,
   checkinTimeoutMs: optionalNumber("CHECKIN_TIMEOUT_SECONDS", 60) * 1_000,
-  resultConfirmationTimeoutMs: optionalNumber("RESULT_CONFIRMATION_MINUTES", 5) * 60_000,
   matchChannelTtlMs: optionalNumber("MATCH_CHANNEL_TTL_MINUTES", 120) * 60_000,
+  channelDeleteDelayMs: 10_000,
   points: { win: 25, loss: -15 },
 } as const;

@@ -4,7 +4,6 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 import { Arena } from "./arena";
-import { permissionReport } from "./permissions";
 import { profilePanel, rankingPanel } from "./presentation";
 
 export const commandData = [
@@ -19,10 +18,6 @@ export const commandData = [
   new SlashCommandBuilder()
     .setName("ranking")
     .setDescription("Exibe a classificacao da modalidade"),
-  new SlashCommandBuilder()
-    .setName("diagnostico")
-    .setDescription("Verifica permissoes e hierarquia do bot")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((command) => command.toJSON());
 
 export async function handleCommand(interaction: ChatInputCommandInteraction, arena: Arena): Promise<void> {
@@ -42,14 +37,5 @@ export async function handleCommand(interaction: ChatInputCommandInteraction, ar
     await interaction.deferReply();
     const players = await arena.store.top(10);
     await interaction.editReply({ embeds: [rankingPanel(players)] });
-    return;
-  }
-  if (interaction.commandName === "diagnostico") {
-    if (!interaction.guild) return;
-    const report = await permissionReport(interaction.guild);
-    await interaction.reply({
-      content: `${report.ok ? "✅" : "⚠️"} ${report.lines.join("\n")}`,
-      ephemeral: true,
-    });
   }
 }

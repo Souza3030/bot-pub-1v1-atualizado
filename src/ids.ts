@@ -2,11 +2,13 @@ export const IDs = {
   queueJoin: "queue:join",
   queueLeave: "queue:leave",
   checkin: "checkin",
-  winnerBlue: "winner:blue",
-  winnerRed: "winner:red",
-  staffBlue: "staff:blue",
-  staffRed: "staff:red",
+  result: "result",
+  resultModal: "result-modal",
+  approve: "staff:approve",
+  reject: "staff:reject",
   void: "staff:void",
+  scoreA: "score-a",
+  scoreB: "score-b",
 } as const;
 
 export function withId(prefix: string, id: string): string {
